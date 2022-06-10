@@ -1,0 +1,207 @@
+# Before running, install required packages:
+{% if notebook %}
+
+!
+{%- else %}
+#
+{%- endif %}
+pip install datasets transformers[sentencepiece] accelerate sacrebleu==1.4.14 codecarbon sacremoses
+
+import collections
+import logging
+import math
+import random
+
+import datasets
+import numpy as np
+import torch
+import transformers
+from accelerate import Accelerator
+from accelerate.logging import get_logger
+from accelerate.utils import set_seed
+from codecarbon import EmissionsTracker
+from datasets import load_dataset
+from torch.optim import {{ optimizer }}
+from torch.utils.data import DataLoader
+from torch.utils.data.dataloader import DataLoader
+from tqdm.auto import tqdm
+from transformers import (AutoConfig, AutoModelForCausalLM, AutoModelForMaskedLM, AutoTokenizer,
+                          DataCollatorForLanguageModeling, Trainer,
+                          TrainingArguments, default_data_collator,
+                          get_scheduler)
+from transformers.utils.versions import require_version
+
+{{ header("Setup") }}
+
+tracker = EmissionsTracker(log_level='error')
+tracker.start()
+
+logger = get_logger(__name__)
+require_version("datasets>=1.8.0")
+
+accelerator = Accelerator()
+set_seed({{ seed }})
+
+logging.basicConfig(
+    format="%(asctime)s - %(levelname)s - %(name)s - %(message)s",
+    datefmt="%m/%d/%Y %H:%M:%S",
+    level=logging.ERROR,
+)
+logger.info(accelerator.state, main_process_only=False)
+if accelerator.is_local_main_process:
+    datasets.utils.logging.set_verbosity_warning()
+    transformers.utils.logging.set_verbosity_info()
+else:
+    datasets.utils.logging.set_verbosity_error()
+    transformers.utils.logging.set_verbosity_error()
+
+{{ header("Load model and dataset") }}
+
+{% if subset == 'default' %}
+datasets = load_dataset('{{dataset}}')
+{% else %}
+datasets = load_dataset('{{dataset}}', '{{ subset }}')
+{% endif %}
+model_checkpoint = "{{model_checkpoint}}"    
+tokenizer = AutoTokenizer.from_pretrained(model_checkpoint, use_fast=True)
+{% if pretrained %}
+model = AutoModelFor{{task}}.from_pretrained(model_checkpoint)
+{% else %}
+config = AutoConfig.from_pretrained(model_checkpoint)
+model = AutoModelFor{{task}}.from_config(config)
+{% endif %}
+model.resize_token_embeddings(len(tokenizer))
+model_name = model_checkpoint.split("/")[-1]
+
+if tokenizer.pad_token is None:
+    tokenizer.pad_token = tokenizer.eos_token
+
+{{ header("Preprocessing") }}
+
+def tokenize_function(examples):
+    result = tokenizer(examples["{{ feature }}"])
+    {% if task=="MaskedLM" %}
+    {% if whole_word_masking %}
+    if tokenizer.is_fast:
+        result["word_ids"] = [result.word_ids(i) for i in range(len(result["input_ids"]))]
+    {% endif %}
+    {% endif %}
+    return result
+
+with accelerator.main_process_first():
+    tokenized_datasets = datasets.map(tokenize_function, batched=True, num_proc=4, remove_columns=list(set(sum(list(datasets.column_names.values()),[]))), desc="Running tokenizer on dataset"
+    )
+
+block_size = {{ block_size }}
+
+def group_texts(examples):
+    # Concatenate all texts.
+    concatenated_examples = {k: sum(examples[k], []) for k in examples.keys()}
+    total_length = len(concatenated_examples[list(examples.keys())[0]])
+    # We drop the small remainder, we could add padding if the model supported it instead of this drop, you can
+        # customize this part to your needs.
+    total_length = (total_length // block_size) * block_size
+    # Split by chunks of max_len.
+    result = {
+        k: [t[i : i + block_size] for i in range(0, total_length, block_size)]
+        for k, t in concatenated_examples.items()
+    }
+    result["labels"] = result["input_ids"].copy()
+    return result
+
+with accelerator.main_process_first():
+    lm_datasets = tokenized_datasets.map(
+        group_texts,
+        batched=True,
+        batch_size=1000,
+        num_proc=4,
+        desc=f"Grouping texts in chunks of {block_size}",
+    )
+
+data_collator = DataCollatorForLanguageModeling(tokenizer, mlm=False)
+batch_size = {{ batch_size }}
+train_dataloader = DataLoader(lm_datasets["{{ train }}"], batch_size=batch_size, shuffle=True, collate_fn=data_collator)
+eval_dataloader = DataLoader(lm_datasets["{{ validation }}"], batch_size=batch_size, collate_fn=data_collator)
+
+{{ header("Training") }}
+
+{% if use_weight_decay %}
+weight_decay = {{ weight_decay }}
+def get_grouped_params(model, no_decay=["bias", "LayerNorm.weight"]):
+    params_with_wd, params_without_wd = [], []
+    for n, p in model.named_parameters():
+        if any(nd in n for nd in no_decay):
+            params_without_wd.append(p)
+        else:
+            params_with_wd.append(p)
+    return [
+        {"params": params_with_wd, "weight_decay": weight_decay},
+        {"params": params_without_wd, "weight_decay": 0.0},
+    ]
+
+optimizer = {{ optimizer }}(get_grouped_params(model), lr={{ lr }})
+{% else %}
+optimizer = {{ optimizer }}(model.parameters(), lr={{ lr }})
+{% endif %}
+
+model, optimizer, train_dataloader, eval_dataloader = accelerator.prepare(
+    model, optimizer, train_dataloader, eval_dataloader
+)
+
+num_train_epochs = {{ num_epochs }}
+gradient_accumulation_steps = {{ gradient_accumulation_steps }}
+num_update_steps_per_epoch = math.ceil(len(train_dataloader) / gradient_accumulation_steps)
+max_train_steps = num_train_epochs * num_update_steps_per_epoch
+output_dir=f"{model_name}-finetuned"
+
+lr_scheduler = get_scheduler(
+    '{{ lr_scheduler_type }}',
+    optimizer=optimizer,
+    num_warmup_steps={{ num_warmup_steps }},
+    num_training_steps=max_train_steps,
+)
+
+progress_bar = tqdm(range(max_train_steps), disable=not accelerator.is_local_main_process)
+for epoch in range(num_train_epochs):
+    # Training
+    model.train()
+    for step, batch in enumerate(train_dataloader):
+        outputs = model(**batch)
+        loss = outputs.loss / gradient_accumulation_steps
+        accelerator.backward(loss)
+        if step % gradient_accumulation_steps == 0 or step == len(train_dataloader) - 1:
+            #TODO Let the user decide on clip grad norm 
+            accelerator.clip_grad_norm_(model.parameters(), 1.0)
+            optimizer.step()
+            lr_scheduler.step()
+            optimizer.zero_grad()
+            progress_bar.update(1)
+ 
+    # Evaluation
+    model.eval()
+    losses = []
+    for step, batch in enumerate(eval_dataloader):
+        with torch.no_grad():
+            outputs = model(**batch)
+
+        loss = outputs.loss
+        losses.append(accelerator.gather(loss.repeat(batch_size)))
+
+    losses = torch.cat(losses)
+    losses = losses[: len(eval_dataloader.dataset)]
+    try:
+        eval_loss = torch.mean(losses)
+        perplexity = math.exp(eval_loss)
+    except OverflowError:
+        perplexity = float("inf")
+
+    accelerator.print(f"epoch {epoch}: perplexity: {perplexity} eval_loss: {eval_loss}")
+    model.train()
+    accelerator.wait_for_everyone()
+    unwrapped_model = accelerator.unwrap_model(model)
+    unwrapped_model.save_pretrained(output_dir, save_function=accelerator.save)
+    if accelerator.is_main_process:
+        tokenizer.save_pretrained(output_dir)
+
+emissions = tracker.stop()
+accelerator.print(f'Emissions: {emissions} kg')

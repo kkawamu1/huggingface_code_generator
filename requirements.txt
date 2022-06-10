@@ -1,0 +1,4 @@
+streamlit
+datasets
+jupytext
+Jinja2
