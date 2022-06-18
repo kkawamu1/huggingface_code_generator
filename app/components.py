@@ -205,7 +205,7 @@ def show_code_component(inputs: Dict[str, str]) -> Dict[str, str]:
 
     st.write(f'## Code view: {inputs["api"]}')
     st.write("")  # add vertical space
-    col1, col2 = st.beta_columns(2)
+    col1, col2 = st.columns(2)
     with col1:
         utils.download_button(code, "generated-code.py", "🐍 Download (.py)")
     with col2:
