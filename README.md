@@ -13,7 +13,7 @@ license: cc
 # huggingface_code_generator
 **This app is a training code generator for 🤗 transformers**
 
-Ever got frustrated when you needed to go through documentations over and over again to write a script, every time you wanted to finetune your favorite model on huggingface? No more! This application allows you to quickly run your experiment by generating a training script with your training configuration. Select one of the two amazing Huggingface training APIs, a NLP task, a model you want to train/finetune, dataset, and hyperparameters on GUI. That's it. Enjoy!
+Ever got frustrated when you needed to go through documentations over and over again to write a script, every time you wanted to finetune your favorite model on huggingface? No more! This application allows you to quickly run your experiment by generating a training script with your training configuration. Select one of the two amazing Huggingface training APIs, a NLP task, a model you want to train/finetune, dataset, and hyperparameters on GUI. That's it. Enjoy! 
 
 
 <p align="center">
@@ -69,3 +69,7 @@ Clone the repository, install the required packages and run:
 ```bash
 streamlit run ./app/main.py
 ```
+
+## Special thanks
+
+Finally, I would like to thank an amazing repository [traingenerator](https://github.com/jrieke/traingenerator) and its author jrieke from which I got the inspiration and I took some of the code piece and a code structure. This app is different from traingenerator in that this app focuses on Huggingface APIs and makes an extensive use of Huggingface library. Thus, this app supports NLP pielines unlike traingenerator. This app also displays the dataset card and data features of the public datasets on the same web page, allowing users to easily select both training parameters and dataset configuration in one tab.
